@@ -42,6 +42,9 @@ node ~/.claude/skills/AgentChat-OneWeb/index.js "<用户prompt>"
 ### 4. 例外
 仅限：`--smoke`、`--doctor`，或用户明确要求"只检查环境不发送"。这两种模式不产生 receipt，属预期行为。
 
+### 5. 本地上下文
+网页 AI 无法访问本地文件系统。涉及本地文件/代码/图片时，Claude Code 须先将内容读入 prompt 再发送，禁止只传文件路径。
+
 ## 📐 输出排版规范 — 最终回答强制格式
 
 约束对象是 Claude Code 撰写的**最终落地文本**；worker 原始输出、代码块、diff、表格与 receipt 行不受约束。

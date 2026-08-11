@@ -61,6 +61,8 @@ N 道独立任务，M 个能力等同的 AI（最多 7：gemini/chatgpt/qwen/kim
 
 11. **附件已在 Step 0 并行提取完毕。** `moodle_scraper.js` 的并行 detail fetch 阶段已一并下载所有附件到 `/tmp/agentchat_scraper_attachments/`（`files[].localPath`）。之后直接进入 OCR/文本提取，**禁止**再开第二轮 Playwright 连接下载。
 
+12. **本地上下文须由 Claude Code 注入 prompt。** 网页 AI 无法访问本地文件系统。派发前 Claude Code 须将涉及的本地文件/代码内容读入 prompt 正文，禁止只传路径指望网页 AI 自读。
+
 ## Step 0：网页内容爬取（仅当题目来源为浏览器页面时）
 
 ```bash
