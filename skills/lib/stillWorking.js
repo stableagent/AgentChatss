@@ -98,14 +98,17 @@ function textLooksBusy(text) {
 // class/aria heuristics are self-contained string sources here; the TEXT
 // classification stays in Node (textLooksBusy) on the returned tail.
 function _domProbe({ sels }) {
+    // PERF FIX (2026-07): getBoundingClientRect() + getComputedStyle() on
+    // 1200 elements per poll caused forced layout reflows on kimi.com,
+    // triggering IntersectionObserver-based auto-scroll → up/down oscillation
+    // loop every 2s. Replaced with offsetParent — single property access,
+    // catches display:none (the common hidden state) without reflow.
+    // visibility:hidden / opacity:0 false-positives are bounded by the
+    // factory's stillGeneratingMaxHoldMs cap, so the trade-off is safe.
     const visible = el => {
         try {
-            if (!el || !el.getBoundingClientRect) return false;
-            const r = el.getBoundingClientRect();
-            if (r.width <= 0 || r.height <= 0) return false;
-            const s = getComputedStyle(el);
-            return s.visibility !== 'hidden' && s.display !== 'none'
-                && s.opacity !== '0';
+            if (!el) return false;
+            return el.offsetParent !== null;
         } catch (_) { return false; }
     };
 
@@ -118,8 +121,9 @@ function _domProbe({ sels }) {
         if (list && list.length) { host = list[list.length - 1]; break; }
     }
 
-    // S2: stop/pause control anywhere on the page. Class-token or aria
-    // anchored — bare substring "stop" would hit "one-stop" marketing copy.
+    // PERF FIX (2026-07): narrowed from 'button, [role="button"]' (scanned
+    // 400+ elements) to only elements whose class/aria suggests stop/pause —
+    // reduces DOM queries from ~400 to <20, eliminating reflow storms.
     const STOPISH = /(?:^|[\s_-])(?:stop|pause)[-_]?(?:btn|button|icon|generat|answer|respon)|(?:^|[\s_-])generating(?:$|[\s_-])/i;
     const STOP_ARIA = /停止|stop\s*(?:generat|respon|answer)|暂停/i;
     let uiBusy = false;
@@ -127,11 +131,11 @@ function _domProbe({ sels }) {
     let ctrls;
     try {
         ctrls = document.querySelectorAll(
-            'button, [role="button"], [class*="stop" i], [class*="pause" i]'
+            '[class*="stop" i], [class*="pause" i], [class*="generat" i], [aria-label*="stop" i], [aria-label*="停止"], [aria-label*="暂停"]'
         );
     } catch (_) { ctrls = []; }
     for (const el of ctrls) {
-        if (++scanned > 400) break;
+        if (++scanned > 100) break;
         const aria = (el.getAttribute && (el.getAttribute('aria-label') || '')) || '';
         const cls = typeof el.className === 'string' ? el.className : '';
         if ((STOP_ARIA.test(aria) || STOPISH.test(cls)) && visible(el)) {
@@ -148,13 +152,20 @@ function _domProbe({ sels }) {
         let nodes;
         try { nodes = host.querySelectorAll('[class]'); } catch (_) { nodes = []; }
         for (const el of nodes) {
-            if (++n > 800) break;
+            if (++n > 200) break;
             const cls = typeof el.className === 'string' ? el.className : '';
             if (cls && SPIN.test(cls) && visible(el)) { uiBusy = true; break; }
         }
     }
 
-    const text = host ? (host.innerText || host.textContent || '') : '';
+    // PERF FIX (2026-07): host.innerText forces a full layout calculation
+    // on the live DOM subtree → triggers kimi.com IntersectionObserver
+    // auto-scroll → up/down oscillation loop. textContent reads the DOM
+    // tree directly without layout computation. Trade-off: includes text
+    // from hidden child elements, but we only use the tail for pattern
+    // matching (textLooksBusy), so false positives are bounded by the
+    // factory's stillGeneratingMaxHoldMs cap.
+    const text = host ? (host.textContent || '') : '';
     return { uiBusy, tail: String(text).slice(-1500) };
 }
 

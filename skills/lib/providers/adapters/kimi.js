@@ -12,6 +12,10 @@
  *     stop-control + spinner DOM signals, bounded by stillGeneratingMaxHoldMs
  *   - v12: ensureKimiFastMode — clicks model selector → "快速模式" (fast mode)
  *     for faster, cheaper responses. Gracefully degrades if selector not found.
+ *   - v21: preInputHook Step 0 — dismisses sidebar .mask overlay before
+ *     clearEditor()/click(), preventing the 30s Playwright timeout from
+ *     "subtree intercepts pointer events". Two-layer defense: click mask
+ *     (natural UX), then force display:none as fallback.
  */
 
 const { COMMON_DISMISS_PATTERNS } = require('../../providerFactory');
@@ -33,6 +37,11 @@ try {
 // still a working Kimi (same lenient policy as Gemini model activation).
 
 /** CSS selectors for the model-switch trigger button on Kimi's page. */
+// PERF FIX (2026-07): removed 3 overly broad selectors that matched
+// unintended elements ([class*="chat-toolbar"] button, [class*="bottom"]
+// [class*="selector"], [class*="input-area"] [class*="select"]). Playwright's
+// loc.click() calls scrollIntoView() before clicking — a wrong match caused
+// one-time page scrolling that destabilized the SPA's scroll position.
 const MODEL_BTN_SELECTORS = [
     '[class*="model-select"]',
     '[class*="ModelSelect"]',
@@ -40,9 +49,6 @@ const MODEL_BTN_SELECTORS = [
     '[class*="mode-switch"]',
     '[class*="modeSwitch"]',
     'button:has(> [class*="model"])',
-    '[class*="chat-toolbar"] button',
-    '[class*="bottom"] [class*="selector"]',
-    '[class*="input-area"] [class*="select"]',
 ];
 
 /** Text / aria-label patterns that signal fast mode is already active. */
@@ -311,6 +317,35 @@ module.exports = {
 
     // ── Start fresh conversation + ensure fast mode ──
     preInputHook: async (page) => {
+        // Step 0: Dismiss sidebar mask overlay.
+        // Kimi's sidebar in is-mobile-expanded state renders a <div class="mask">
+        // translucent overlay on top of the main content area. When the
+        // automation flow reaches clearEditor() → editor.click(), Playwright's
+        // actionability check sees the mask intercepting pointer events, retries
+        // 55 times, and fails with a 30s timeout (locator.click: Timeout 30000ms
+        // exceeded — <div class="mask"> subtree intercepts pointer events).
+        //
+        // Two-layer defense:
+        //   1. mask.click() — simulates user tapping the overlay, which triggers
+        //      Kimi's own sidebar-collapse logic (most natural path).
+        //   2. mask.style.display = 'none' — fallback if click doesn't stick
+        //      (e.g. the event listener sits on a parent element).
+        try {
+            const dismissed = await page.evaluate(() => {
+                const mask = document.querySelector('.mask');
+                if (!mask || mask.offsetParent === null) return false;
+                mask.click();
+                return true;
+            });
+            if (dismissed) {
+                await page.waitForTimeout(1000);
+                await page.evaluate(() => {
+                    const m = document.querySelector('.mask');
+                    if (m && m.offsetParent !== null) m.style.display = 'none';
+                }).catch(() => {});
+            }
+        } catch (_) { /* non-critical — proceed with page default */ }
+
         // Step 1: Click "新建会话" to start a fresh conversation
         try {
             const clicked = await page.evaluate(() => {
@@ -360,31 +395,45 @@ module.exports = {
         '[role="textbox"]',
     ],
 
-    // ── Kimi's send button loses "disabled" class when text is entered ──
-    customSend: async (page) => {
-        const sendBtn = page.locator('.send-button-container').first();
-        await page.waitForTimeout(800);
-        // BUGFIX: catch default was inverted. If the button doesn't exist,
-        // evaluate() rejects → .catch(() => false) claimed "not disabled" →
-        // sendBtn.click() then burned a 30s locator timeout and failed the
-        // whole provider. A missing/unknown button must route to Enter.
-        const isDisabled = await sendBtn.evaluate(
-            el => el.className.includes('disabled')
-        ).catch(() => true);
-        if (isDisabled) {
-            await page.keyboard.press('Enter');
-        } else {
-            try {
-                await sendBtn.click({ timeout: 5000 });
-            } catch (_) {
-                await page.keyboard.press('Enter'); // click failed → Enter fallback
-            }
-        }
+    // ── v26: Kimi's React contenteditable corrupts every async input path
+    // (DataTransfer paste, clipboard, keyboard.insertText).  document.execCommand
+    // ('insertText') is a synchronous browser-native contenteditable write — one
+    // atomic operation that replaces the selection.  React's mutation observer
+    // picks up the DOM change post-commit, avoiding the race conditions that
+    // shred chunked/keyboard input.  Short prompts go through the same path for
+    // consistency.
+    input: async (page, editor, prompt) => {
+        await editor.focus();
+        await page.waitForTimeout(200);
+        await editor.evaluate((el, text) => {
+            // Select all existing content then replace in one atomic operation
+            el.focus();
+            const sel = window.getSelection();
+            sel.selectAllChildren(el);
+            document.execCommand('insertText', false, text);
+        }, prompt);
+        await page.waitForTimeout(1500);
+        return true;
     },
+
+    // ── v26: Use factory clickSend (same as ChatGPT) — enabled-polling,
+    // selector rotation, Enter fallback, commit tracking. Replaces the
+    // fragile customSend that only knew about .send-button-container.
+    sendSelectors: [
+        '.send-button-container',          // Kimi-specific primary
+        'button[aria-label*="发送"]',
+        '[class*="send-btn"]',
+        '[class*="send-button"]',
+    ],
+    sendFallback: 'Enter',
 
     responseSelectors: RESPONSE_SELECTORS,
     responseSelectorTimeout: 60_000,
     stabilityWindow: 8_000,
+    // PERF FIX (2026-07): explicit pollInterval=3000 (was default 2000).
+    // Each poll triggers _domProbe which scans DOM elements; 3s vs 2s
+    // reduces probe frequency by 33%, cutting reflow-induced scroll cycles.
+    pollInterval: 3_000,
     minResponseLength: 10,
 
     // ── Prevent premature "done" during Kimi's multi-round search pauses ──
@@ -413,7 +462,12 @@ module.exports = {
     // bursts for minutes; the cap re-arms on every REAL text change, so it
     // only bounds a terminal stall (e.g. a final answer whose last line
     // happens to look like a status chip).
-    stillGeneratingMaxHoldMs: 180_000,
+    // PERF FIX (2026-07): reduced from 180s to 90s — 3 minutes of polling
+    // at 2s intervals meant up to 90 _domProbe executions, each causing
+    // layout reflows. 90s is sufficient for Kimi's multi-round search
+    // phases (typical: 15-45s), and the cap re-arms on every real text
+    // change so it only bounds terminal stalls.
+    stillGeneratingMaxHoldMs: 90_000,
 
     // ── Reject truncated responses (Kimi occasionally stops mid-sentence) ──
     postResponseHook: async (_page, text) => {
